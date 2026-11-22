@@ -1,0 +1,417 @@
+
+import cv2
+import pytesseract
+from pytesseract import Output
+from picamera2 import Picamera2
+from libcamera import controls
+import time
+import re
+
+# =========================================
+# SETTINGS
+# =========================================
+
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
+PREVIEW_WIDTH = 800
+PREVIEW_HEIGHT = 450
+
+# Single wide ROI
+roi_x = 0.08
+roi_y = 0.25
+roi_w = 0.90
+roi_h = 0.60
+
+ROI_STEP = 0.01
+
+# Inspection confirmation
+VERIFY_SECONDS = 2.0
+REQUIRED_MARKINGS = 2
+MIN_CONFIDENCE = 45
+MIN_MATCHING_FRAMES = 3
+
+# Require observations spread across time
+MIN_CONFIRM_SPAN = 0.20
+
+OCR_CONFIG = (
+    "--oem 3 --psm 11 "
+    "-c tessedit_char_whitelist=0123456789"
+)
+
+# =========================================
+# CAMERA INITIALIZATION
+# =========================================
+
+picam2 = Picamera2()
+
+config = picam2.create_preview_configuration(
+    main={
+        "size": (CAMERA_WIDTH, CAMERA_HEIGHT),
+        "format": "RGB888"
+    }
+)
+
+picam2.configure(config)
+
+picam2.set_controls({
+    "AfMode": controls.AfModeEnum.Continuous
+})
+
+picam2.start()
+time.sleep(3)
+
+# =========================================
+# SESSION STATES
+# =========================================
+
+IDLE = "IDLE"
+INSPECTING = "INSPECTING"
+WAIT_FEEDBACK = "WAIT_FEEDBACK"
+
+state = IDLE
+
+session_start = 0.0
+result = None
+good_frames = 0
+first_good_time = None
+last_candidate = None
+
+# =========================================
+# IMAGE PROCESSING
+# =========================================
+
+def preprocess(image):
+    gray = cv2.cvtColor(
+        image, cv2.COLOR_BGR2GRAY
+    )
+
+    enlarged = cv2.resize(
+        gray, None,
+        fx=2, fy=2,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    blurred = cv2.GaussianBlur(
+        enlarged, (3, 3), 0
+    )
+
+    _, binary = cv2.threshold(
+        blurred, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    return binary
+
+
+def detect_numbers(roi):
+    processed = preprocess(roi)
+
+    data = pytesseract.image_to_data(
+        processed,
+        config=OCR_CONFIG,
+        output_type=Output.DICT
+    )
+
+    found = []
+
+    for i, raw in enumerate(data["text"]):
+        digits = re.sub(r"\D", "", raw)
+
+        if digits not in ("58", "63"):
+            continue
+
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            continue
+
+        if conf < MIN_CONFIDENCE:
+            continue
+
+        x = data["left"][i] // 2
+        y = data["top"][i] // 2
+        w = data["width"][i] // 2
+        h = data["height"][i] // 2
+
+        found.append({
+            "number": digits,
+            "confidence": conf,
+            "box": (x, y, w, h)
+        })
+
+    return found
+
+
+def classify(detections):
+    count58 = sum(
+        d["number"] == "58" for d in detections
+    )
+    count63 = sum(
+        d["number"] == "63" for d in detections
+    )
+
+    if count58 and count63:
+        return None
+
+    if count58 >= REQUIRED_MARKINGS:
+        return "58"
+
+    if count63 >= REQUIRED_MARKINGS:
+        return "63"
+
+    return None
+
+
+def get_roi(frame):
+    h, w = frame.shape[:2]
+
+    x = int(roi_x * w)
+    y = int(roi_y * h)
+    rw = int(roi_w * w)
+    rh = int(roi_h * h)
+
+    x = max(0, min(x, w - 1))
+    y = max(0, min(y, h - 1))
+
+    rw = max(1, min(rw, w - x))
+    rh = max(1, min(rh, h - y))
+
+    return (
+        frame[y:y+rh, x:x+rw],
+        (x, y, rw, rh)
+    )
+
+
+# =========================================
+# SESSION CONTROL
+# =========================================
+
+def start_session():
+    global state, session_start
+    global result, good_frames
+    global first_good_time, last_candidate
+
+    if state != IDLE:
+        return
+
+    session_start = time.monotonic()
+    result = None
+    good_frames = 0
+    first_good_time = None
+    last_candidate = None
+
+    state = INSPECTING
+    print("SESSION STARTED")
+
+
+def finish_inspection(value):
+    global state, result
+
+    result = value
+    state = WAIT_FEEDBACK
+
+    print("INSPECTION COMPLETE:", result)
+    print("RESULT LOCKED - WAITING FEEDBACK")
+
+
+def end_session():
+    global state, result
+    global good_frames, first_good_time
+    global last_candidate
+
+    if state == IDLE:
+        return
+
+    print("FEEDBACK RECEIVED")
+    print("SESSION ENDED")
+
+    state = IDLE
+    result = None
+    good_frames = 0
+    first_good_time = None
+    last_candidate = None
+
+
+# =========================================
+# ROI KEYBOARD CONTROL
+# =========================================
+
+def adjust_roi(key):
+    global roi_x, roi_y, roi_w, roi_h
+
+    if key == ord("w"):
+        roi_y -= ROI_STEP
+    elif key == ord("s"):
+        roi_y += ROI_STEP
+    elif key == ord("a"):
+        roi_x -= ROI_STEP
+    elif key == ord("d"):
+        roi_x += ROI_STEP
+    elif key == ord("i"):
+        roi_h += ROI_STEP
+    elif key == ord("k"):
+        roi_h -= ROI_STEP
+    elif key == ord("l"):
+        roi_w += ROI_STEP
+    elif key == ord("j"):
+        roi_w -= ROI_STEP
+
+    roi_x = max(0.0, min(roi_x, 0.95))
+    roi_y = max(0.0, min(roi_y, 0.95))
+    roi_w = max(0.05, min(roi_w, 1.0-roi_x))
+    roi_h = max(0.05, min(roi_h, 1.0-roi_y))
+
+
+# =========================================
+# MAIN LOOP
+# =========================================
+
+WINDOW = "VISION 58-63"
+
+cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+
+print("VISION SYSTEM READY")
+print("T = PHOTOSENSOR TRIGGER (SIMULATION)")
+print("F = FEEDBACK SENSOR (SIMULATION)")
+print("WASD = MOVE ROI")
+print("I/K = HEIGHT, L/J = WIDTH")
+print("Q = QUIT")
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        now = time.monotonic()
+
+        roi, (rx, ry, rw, rh) = get_roi(frame)
+
+        detections = []
+
+        if state == INSPECTING:
+            elapsed = now - session_start
+
+            if elapsed >= VERIFY_SECONDS:
+                finish_inspection("UNKNOWN")
+            else:
+                detections = detect_numbers(roi)
+                candidate = classify(detections)
+
+                # Only matching consecutive frames count.
+                if candidate is None:
+                    good_frames = 0
+                    first_good_time = None
+                    last_candidate = None
+
+                elif candidate == last_candidate:
+                    good_frames += 1
+
+                else:
+                    last_candidate = candidate
+                    good_frames = 1
+                    first_good_time = time.monotonic()
+
+                if (
+                    candidate is not None
+                    and good_frames >= MIN_MATCHING_FRAMES
+                    and first_good_time is not None
+                    and (
+                        time.monotonic() - first_good_time
+                        >= MIN_CONFIRM_SPAN
+                    )
+                ):
+                    finish_inspection(candidate)
+
+        # Draw single ROI
+        cv2.rectangle(
+            frame,
+            (rx, ry),
+            (rx+rw, ry+rh),
+            (0, 255, 0),
+            2
+        )
+
+        # Draw detected numbers
+        for item in detections:
+            x, y, w, h = item["box"]
+
+            x += rx
+            y += ry
+
+            cv2.rectangle(
+                frame,
+                (x, y),
+                (x+w, y+h),
+                (255, 0, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                item["number"],
+                (x, max(20, y-8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 0, 0),
+                2
+            )
+
+        # Display session status
+        status = result if result else state
+
+        color = (
+            (0, 255, 0)
+            if result in ("58", "63")
+            else (0, 0, 255)
+        )
+
+        cv2.putText(
+            frame,
+            "STATUS: " + status,
+            (25, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            color,
+            3
+        )
+
+        cv2.putText(
+            frame,
+            "STATE: " + state,
+            (25, 95),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),
+            2
+        )
+
+        preview = cv2.resize(
+            frame,
+            (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+            interpolation=cv2.INTER_AREA
+        )
+
+        cv2.imshow(WINDOW, preview)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+        elif key == ord("t"):
+            start_session()
+
+        elif key == ord("f"):
+            end_session()
+
+        else:
+            adjust_roi(key)
+
+except KeyboardInterrupt:
+    print("STOP REQUESTED")
+
+finally:
+    picam2.stop()
+    cv2.destroyAllWindows()
+    print("VISION STOPPED")
